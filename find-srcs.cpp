@@ -42,7 +42,7 @@ void print_files_tracked_by_repo_subfolder(filesystem::path gitroot, string gitr
             dir_it.disable_recursion_pending();
             continue;
         }
-        if (dir_it->is_directory() && !dir_it->is_symlink()) {
+        if (!dir_it->is_symlink() && dir_it->is_directory()) {
             if (find(submodules_in_rootpath.begin(), submodules_in_rootpath.end(), dir_it->path()) != submodules_in_rootpath.end()) {
                 dir_it.disable_recursion_pending();
             }
@@ -93,7 +93,7 @@ void print_files_tracked_by_repo_subfolder(filesystem::path gitroot, string gitr
     close(from_git_fds[0]);
 
     vector<string>::iterator file_iterator = all_files.begin();
-    std::string file_to_skip;
+    string file_to_skip;
 
     while (getline(full_read, file_to_skip)) {
         while (file_iterator->compare(file_to_skip) != 0) {
@@ -118,38 +118,54 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    bool found_gitroot = false;
-    filesystem::path gitroot_to_rootpath;
-    filesystem::path gitroot = filesystem::weakly_canonical(argv[1]);
+    try {
+        bool found_gitroot = false;
+        filesystem::path gitroot_to_rootpath;
+        filesystem::path gitroot = filesystem::weakly_canonical(argv[1]);
 
-    if (!filesystem::exists(gitroot)) {
-        cerr << argv[1] << " (" << gitroot.string() << ") does not exist" << endl;
-        return 1;
-    }
+        if (!filesystem::exists(gitroot)) {
+            cerr << gitroot << " does not exist" << endl;
+            return 1;
+        }
 
-    if (!filesystem::is_directory(gitroot)) {
-        cerr << argv[1] << " (" << gitroot.string() << ") is not a directory" << endl;
-        return 1;
-    }
+        if (!filesystem::is_directory(gitroot)) {
+            cerr << gitroot << " is not a directory" << endl;
+            return 1;
+        }
 
-    while (!found_gitroot) {
-        for (const filesystem::directory_entry& dir_entry : filesystem::directory_iterator(gitroot)) {
-            if (dir_entry.path().filename() == ".git") {
-                found_gitroot = true;
-                break;
+        while (!found_gitroot) {
+            for (const filesystem::directory_entry& dir_entry : filesystem::directory_iterator(gitroot)) {
+                if (dir_entry.path().filename() == ".git") {
+                    found_gitroot = true;
+                    break;
+                }
+            }
+            if (!found_gitroot) {
+                if (gitroot.parent_path() == gitroot) {
+                    cerr << filesystem::weakly_canonical(argv[1]) << " is not inside a git repository" << endl;
+                    return 1;
+                }
+                gitroot_to_rootpath = gitroot.filename() / gitroot_to_rootpath;
+                gitroot = gitroot.parent_path();
             }
         }
-        if (!found_gitroot) {
-            if (gitroot.parent_path() == gitroot) {
-                cerr << argv[1] << " (" << filesystem::weakly_canonical(argv[1]).string() << ") is not inside a git repository" << endl;
-                return 1;
-            }
-            gitroot_to_rootpath = gitroot.filename() / gitroot_to_rootpath;
-            gitroot = gitroot.parent_path();
-        }
-    }
 
-    print_files_tracked_by_repo_subfolder(gitroot, gitroot_to_rootpath.string());
+        print_files_tracked_by_repo_subfolder(gitroot, gitroot_to_rootpath.string());
+    } catch (filesystem::filesystem_error err) {
+        string problem_path = "\"" + err.path1().string() + "\"";
+        if (problem_path == "\"\"") {
+            problem_path = string("Some subpath of ") + argv[1];
+        }
+
+        if (err.code().value() == ELOOP) {
+            cerr << problem_path << " is a symlink loop, but a directory was required" << endl;
+        } else if (err.code().value() == EACCES) {
+            cerr << problem_path << " is inaccessible (permission denied)" << endl;
+        } else {
+            cerr << err.what() << endl;
+        }
+        return 1;
+    }
 
     return 0;
 }
