@@ -11,7 +11,7 @@ jobs:
             shell: sh
           - uses: actions/upload-artifact@v7
             with:
-                name:
+                name: find-srcs
                 path: |
                     build/find-srcs
                     build/sources.md5
