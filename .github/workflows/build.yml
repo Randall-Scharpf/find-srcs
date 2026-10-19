@@ -1,0 +1,17 @@
+on:
+  - push
+  - release
+
+jobs:
+    build-ubuntu:
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/checkout@v7
+          - run: ./build.sh
+            shell: sh
+          - uses: actions/upload-artifact@v7
+            with:
+                name:
+                path: |
+                    build/find-srcs
+                    build/sources.md5
