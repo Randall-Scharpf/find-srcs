@@ -5,107 +5,204 @@
 #include <sys/wait.h>
 
 #include <algorithm>
+#include <atomic>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <mutex>
 #include <regex>
+#include <thread>
+#include <unordered_set>
 #include <vector>
 
 using namespace std;
 
+#define IDLE_TASK_SLEEP_US 100
+
+class git_ignore_pruner {
+    public:
+        git_ignore_pruner(filesystem::path repository_path) {
+            repo_root = repository_path;
+
+            int to_git_fds[2];
+            int from_git_fds[2];
+            pipe(to_git_fds);
+            pipe(from_git_fds);
+            fcntl(to_git_fds[1], F_SETFD, fcntl(to_git_fds[1], F_GETFD) | FD_CLOEXEC);
+            fcntl(from_git_fds[0], F_SETFD, fcntl(from_git_fds[0], F_GETFD) | FD_CLOEXEC);
+
+            git_pid = fork();
+            if (git_pid == 0) {
+                dup2(to_git_fds[0], STDIN_FILENO);
+                dup2(from_git_fds[1], STDOUT_FILENO);
+                if (chdir(repository_path.c_str()) == 0) {
+                    execlp("git", "git", "check-ignore", "--stdin", "--verbose", "--non-matching", nullptr);
+                    perror("execlp");
+                }
+                exit(1);
+            }
+
+            close(to_git_fds[0]);
+            close(from_git_fds[1]);
+            to_git_write_stream = fdopen(to_git_fds[1], "w");
+            if (to_git_write_stream == nullptr) perror("fdopen");
+            from_git_read_stream = fdopen(from_git_fds[0], "r");
+            if (from_git_read_stream == nullptr) perror("fdopen");
+
+            pending_paths.store(0);
+            stop_reader_thread = false;
+            output_reader = thread([&]{
+                char* line = nullptr;
+                size_t line_alloc;
+                size_t line_length;
+                while (!stop_reader_thread) {
+                    if ((line_length = getline(&line, &line_alloc, from_git_read_stream)) != -1) {
+                        line[line_length - 1] = '\0';
+
+                        char* first_colon = line ? strchr(line, ':') : nullptr;
+                        char* second_colon = first_colon ? strchr(first_colon + 1, ':') : nullptr;
+                        char* tab = second_colon ? strchr(second_colon + 1, '\t') : nullptr;
+
+                        if (((second_colon[1] == '!') || (second_colon[1] == '\t')) && (tab != nullptr)) {
+                            queued_outputs_lock.lock();
+                            queued_outputs.push_back(filesystem::path(tab + 1));
+                            queued_outputs_lock.unlock();
+                        }
+                        pending_paths.fetch_sub(1);
+                    } else {
+                        usleep(IDLE_TASK_SLEEP_US);
+                    }
+                }
+                free(line);
+            });
+        }
+
+        ~git_ignore_pruner() {
+            fclose(to_git_write_stream);
+            int waitstatus = 0;
+            do {
+                waitpid(git_pid, &waitstatus, WNOHANG);
+            } while(!WIFEXITED(waitstatus));
+
+            stop_reader_thread = true;
+            output_reader.join();
+            fclose(from_git_read_stream);
+        }
+
+        void check_path(filesystem::path path_to_check) {
+            if ((path_to_check.filename() == ".git") && (path_to_check.parent_path() == repo_root)) {
+                return;
+            }
+            string path_str = path_to_check.string();
+            fputs(path_str.c_str(), to_git_write_stream);
+            fputs("\n", to_git_write_stream);
+            fflush(to_git_write_stream);
+            pending_paths.fetch_add(1);
+        }
+
+        vector<filesystem::path> get_paths() {
+            vector<filesystem::path> result;
+            queued_outputs_lock.lock();
+            swap(result, queued_outputs);
+            queued_outputs_lock.unlock();
+            return result;
+        }
+
+        bool all_paths_checked() {
+            return pending_paths.load() == 0;
+        }
+
+    private:
+        filesystem::path repo_root;
+
+        thread output_reader;
+        bool stop_reader_thread;
+
+        vector<filesystem::path> queued_outputs;
+        mutex queued_outputs_lock;
+        atomic<size_t> pending_paths;
+
+        pid_t git_pid;
+        FILE* to_git_write_stream;
+        FILE* from_git_read_stream;
+};
+
 void print_files_tracked_by_repo_subfolder(filesystem::path gitroot, string gitroot_to_rootpath = "") {
     ifstream gitmodules(gitroot / ".gitmodules");
-    vector<filesystem::path> submodules_in_rootpath;
+    unordered_set<filesystem::path> submodules_in_rootpath;
     if (gitmodules.is_open())
     {
-        regex path_key_regex("\\s*path\\s*=\\s*(.*)");
+        regex path_key_regex("\\s*path\\s*=\\s*(.*)\\s*");
         smatch match;
 
         string line;
         while (getline(gitmodules, line)) {
             if (regex_match(line, match, path_key_regex)) {
                 if (match[1].str().substr(0, gitroot_to_rootpath.size()) == gitroot_to_rootpath) {
-                    submodules_in_rootpath.push_back(gitroot / match[1].str());
+                    submodules_in_rootpath.insert(gitroot / match[1].str());
                 }
             }
         }
     }
 
-    vector<string> all_files;
-    size_t max_path_length = 0;
-    for (
-        auto dir_it = filesystem::recursive_directory_iterator(gitroot / gitroot_to_rootpath);
-        dir_it != filesystem::recursive_directory_iterator();
-        dir_it++
-    ) {
-        if (dir_it->path().filename() == ".git") {
-            dir_it.disable_recursion_pending();
-            continue;
-        }
-        if (!dir_it->is_symlink() && dir_it->is_directory()) {
-            if (find(submodules_in_rootpath.begin(), submodules_in_rootpath.end(), dir_it->path()) != submodules_in_rootpath.end()) {
-                dir_it.disable_recursion_pending();
+    git_ignore_pruner repo_file_pruner(gitroot);
+    git_ignore_pruner repo_folder_pruner(gitroot);
+
+    vector<filesystem::path> folders_to_go;
+    folders_to_go.push_back(gitroot);
+
+    bool done_producing_inputs = false;
+    thread output_handler([&]{
+        vector<filesystem::path> files_to_go;
+
+        while (true) {
+            for (const filesystem::path& output : files_to_go) {
+                cout << output.string() << endl;
             }
-        } else {
-            string path = dir_it->path().string();
-            all_files.push_back(path);
-            max_path_length = max(path.size(), max_path_length);
+
+            bool all_inputs_processed = repo_file_pruner.all_paths_checked();
+            files_to_go = repo_file_pruner.get_paths();
+
+            if (files_to_go.empty()) {
+                if (done_producing_inputs && all_inputs_processed) {
+                    break;
+                }
+                else {
+                    usleep(IDLE_TASK_SLEEP_US);
+                }
+            }
+        }
+    });
+
+    while (true) {
+        for (const filesystem::path& folder : folders_to_go) {
+            for (const filesystem::directory_entry& item : filesystem::directory_iterator(folder)) {
+                if (!item.is_symlink() && item.is_directory()) {
+                    if (submodules_in_rootpath.find(item.path()) == submodules_in_rootpath.end()) {
+                        repo_folder_pruner.check_path(item.path());
+                    }
+                }
+                else {
+                    repo_file_pruner.check_path(item.path());
+                }
+            }
+        }
+
+        bool all_inputs_processed = repo_folder_pruner.all_paths_checked();
+        folders_to_go = repo_folder_pruner.get_paths();
+
+        if (folders_to_go.empty()) {
+            if (all_inputs_processed) {
+                break;
+            }
+            else {
+                usleep(IDLE_TASK_SLEEP_US);
+            }
         }
     }
 
-    int to_git_fds[2];
-    int from_git_fds[2];
-    pipe(to_git_fds);
-    pipe(from_git_fds);
-    fcntl(to_git_fds[1], F_SETFD, fcntl(to_git_fds[1], F_GETFD) | FD_CLOEXEC);
-    fcntl(from_git_fds[0], F_SETFD, fcntl(from_git_fds[0], F_GETFD) | FD_CLOEXEC);
-
-    pid_t pid = fork();
-    if (pid == 0) {
-        dup2(to_git_fds[0], STDIN_FILENO);
-        dup2(from_git_fds[1], STDOUT_FILENO);
-        if (chdir(gitroot.c_str()) == 0) {
-            execlp("git", "git", "check-ignore", "--stdin", nullptr);
-        }
-        exit(1);
-    }
-
-    close(to_git_fds[0]);
-    close(from_git_fds[1]);
-
-    for (const string &file : all_files) {
-        write(to_git_fds[1], file.c_str(), file.size());
-        write(to_git_fds[1], "\n", 1);
-    }
-    close(to_git_fds[1]);
-
-    stringstream full_read;
-    char block_read[1024];
-    int waitstatus = false;
-    do {
-        int read_len;
-        do {
-            read_len = read(from_git_fds[0], block_read, sizeof(block_read));
-            full_read.write(block_read, read_len);
-        } while (read_len > 0);
-        waitpid(pid, &waitstatus, WNOHANG);
-    } while (!WIFEXITED(waitstatus));
-    close(from_git_fds[0]);
-
-    vector<string>::iterator file_iterator = all_files.begin();
-    string file_to_skip;
-
-    while (getline(full_read, file_to_skip)) {
-        while (file_iterator->compare(file_to_skip) != 0) {
-            cout << *file_iterator << endl;
-            file_iterator++;
-        }
-        file_iterator++;
-    }
-    while (file_iterator != all_files.end()) {
-        cout << *file_iterator << endl;
-        file_iterator++;
-    }
+    done_producing_inputs = true;
+    output_handler.join();
 
     for (const filesystem::path& sub : submodules_in_rootpath) {
         print_files_tracked_by_repo_subfolder(sub);

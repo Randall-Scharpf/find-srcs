@@ -11,7 +11,7 @@ find-srcs ROOT_PATH
  - ROOT_PATH must be an absolute or relative path to a directory, not a regular file.
  - The directory indicated by ROOT_PATH must be contained within a git repository.
  - If ROOT_PATH is a symlink, it must not point to a regular file, be dangling, or point to a file system loop.
- - The user running `find-srcs` must have read access to ROOT_PATH and every subdirectory thereof.
+ - The user running `find-srcs` must have read access to ROOT_PATH and every non-ignored subdirectory thereof.
 
 ## Output Details
 - On success, the command returns `0`. If an error occurs, the command returns `1`.
@@ -37,7 +37,7 @@ $ ~/find-srcs/build/find-srcs teach.github.com/
 /tmp/teach.github.com/README.md
 $ ls -a teach.github.com/
 .  ..  .git  LICENSE.md  README.md
-$ 
+$
 ```
 
 ## Building
