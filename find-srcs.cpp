@@ -17,12 +17,15 @@
 
 using namespace std;
 
-#define IDLE_TASK_SLEEP_US 100
+static int exitstatus = 0;
+constexpr int IDLE_TASK_SLEEP_US = 100;
 
 class git_ignore_pruner {
     public:
         git_ignore_pruner(filesystem::path repository_path) {
             repo_root = repository_path;
+            pending_paths.store(0);
+            stop_reader_thread = false;
 
             int to_git_fds[2];
             int from_git_fds[2];
@@ -31,26 +34,28 @@ class git_ignore_pruner {
             fcntl(to_git_fds[1], F_SETFD, fcntl(to_git_fds[1], F_GETFD) | FD_CLOEXEC);
             fcntl(from_git_fds[0], F_SETFD, fcntl(from_git_fds[0], F_GETFD) | FD_CLOEXEC);
 
-            git_pid = fork();
-            if (git_pid == 0) {
+            child_pid = fork();
+            if (child_pid == 0) {
                 dup2(to_git_fds[0], STDIN_FILENO);
                 dup2(from_git_fds[1], STDOUT_FILENO);
                 if (chdir(repository_path.c_str()) == 0) {
                     execlp("git", "git", "check-ignore", "--stdin", "--verbose", "--non-matching", nullptr);
-                    perror("execlp");
                 }
-                exit(1);
+                exit(255);
             }
 
             close(to_git_fds[0]);
             close(from_git_fds[1]);
             to_git_write_stream = fdopen(to_git_fds[1], "w");
-            if (to_git_write_stream == nullptr) perror("fdopen");
             from_git_read_stream = fdopen(from_git_fds[0], "r");
-            if (from_git_read_stream == nullptr) perror("fdopen");
 
-            pending_paths.store(0);
-            stop_reader_thread = false;
+            child_status = __W_CONTINUED;
+            child_monitor = thread([&]{
+                do {
+                    waitpid(child_pid, &child_status, WUNTRACED);
+                } while(!WIFEXITED(child_status));
+            });
+
             output_reader = thread([&]{
                 char* line = nullptr;
                 size_t line_alloc;
@@ -79,14 +84,20 @@ class git_ignore_pruner {
 
         ~git_ignore_pruner() {
             fclose(to_git_write_stream);
-            int waitstatus = 0;
-            do {
-                waitpid(git_pid, &waitstatus, WNOHANG);
-            } while(!WIFEXITED(waitstatus));
+            child_monitor.join();
 
             stop_reader_thread = true;
             output_reader.join();
             fclose(from_git_read_stream);
+
+            if (WEXITSTATUS(child_status) == 128) {
+                cerr << "git encountered a fatal error" << endl;
+                exitstatus = 1;
+            }
+            if (WEXITSTATUS(child_status) == 255) {
+                cerr << "failed to exec \"git\", executable must be on PATH at runtime" << endl;
+                exitstatus = 1;
+            }
         }
 
         void check_path(filesystem::path path_to_check) {
@@ -109,7 +120,7 @@ class git_ignore_pruner {
         }
 
         bool all_paths_checked() {
-            return pending_paths.load() == 0;
+            return (pending_paths.load() == 0) || WIFEXITED(child_status);
         }
 
     private:
@@ -122,7 +133,9 @@ class git_ignore_pruner {
         mutex queued_outputs_lock;
         atomic<size_t> pending_paths;
 
-        pid_t git_pid;
+        pid_t child_pid;
+        int child_status;
+        thread child_monitor;
         FILE* to_git_write_stream;
         FILE* from_git_read_stream;
 };
@@ -149,7 +162,7 @@ void print_files_tracked_by_repo_subfolder(filesystem::path gitroot, string gitr
     git_ignore_pruner repo_folder_pruner(gitroot);
 
     vector<filesystem::path> folders_to_go;
-    folders_to_go.push_back(gitroot);
+    folders_to_go.push_back(gitroot / gitroot_to_rootpath);
 
     bool done_producing_inputs = false;
     thread output_handler([&]{
@@ -264,5 +277,5 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    return 0;
+    return exitstatus;
 }

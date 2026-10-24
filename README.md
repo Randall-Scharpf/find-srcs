@@ -12,6 +12,7 @@ find-srcs ROOT_PATH
  - The directory indicated by ROOT_PATH must be contained within a git repository.
  - If ROOT_PATH is a symlink, it must not point to a regular file, be dangling, or point to a file system loop.
  - The user running `find-srcs` must have read access to ROOT_PATH and every non-ignored subdirectory thereof.
+ - The `git` command-line tool must be installed and accessible on the system PATH.
 
 ## Output Details
 - On success, the command returns `0`. If an error occurs, the command returns `1`.
